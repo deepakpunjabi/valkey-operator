@@ -1,8 +1,20 @@
 # Valkey and ValkeySentinel Design Proposal
 
+### Revisions
+
+Discussed in [discussion #387](https://github.com/valkey-io/valkey-operator/discussions/387). Each revision links to the document as it read at that commit. Full history: [feat/valkeysentinel-design](https://github.com/deepakpunjabi/valkey-operator/commits/feat/valkeysentinel-design/).
+
+| Rev | Change | Document |
+| --- | --- | --- |
+| 1 | Initial proposal. Two CRDs, selector linkage, Sentinel as the failover authority. | [`6563529`](https://github.com/deepakpunjabi/valkey-operator/blob/6563529/docs/valkeysentinel-design.md) |
+| 2 | `spec.failover` replaces `spec.sentinel`, dropping the `required` bool. <br>Boot-time discovery init container. <br>One Sentinel per instance, enforced. <br>Role-selector Services dropped. <br>Deregistration finalizer. PDB config duplicated per CRD. | [`64c67da`](https://github.com/deepakpunjabi/valkey-operator/blob/64c67da/docs/valkeysentinel-design.md) |
+
+## Summary
+
 This document proposes support for Valkey **replication mode with Sentinel** in the valkey-operator, alongside the existing cluster mode ([architecture.md](https://github.com/valkey-io/valkey-operator/blob/main/docs/architecture.md)).
 
 It is written to converge with the discussion in [issue #198](https://github.com/valkey-io/valkey-operator/issues/198) and the selector-linked draft in [VALKEY_AND_SENTINEL.md](https://github.com/user-attachments/files/31247232/VALKEY_AND_SENTINEL.md) and adopts their settled decisions: two CRDs (`Valkey` + `ValkeySentinel`), Sentinel tuning as `map[string]string` passthrough rather than typed fields, `spec.replicas` counting replicas in addition to the primary, and Sentinel pods managed as a StatefulSet for the MVP. Where it differs, it says so and why. Design also tries to align with future work on [ValkeyCell CRD](https://github.com/valkey-io/valkey-operator/issues/226).
+
 
 ## Motivation
 
