@@ -30,7 +30,7 @@ Today the operator supports cluster mode only ([quickstart.md](https://github.co
 - One primary + N replicas managed as a single logical unit, with automated failover by a Sentinel quorum.
 - Failover works while the operator is down. Sentinel(not the operator) is the failover authority.
 - Reuse `ValkeyNode` for the data plane **without modifying it**. Sentinel pods are a StatefulSet for the MVP, but share the pod-template builder with `ValkeyNode` rather than duplicating it.
-- Reuse existing ValkeyCluster building blocks where they transfer: ACL/system users, TLS, persistence, scheduling, exporter and config hashing. The PDB config type is duplicated per CRD rather than shared; see [PodDisruptionBudget and TLS types](#poddisruptionbudget-and-tls-types).
+- Reuse existing ValkeyCluster building blocks where they transfer: ACL/system users, persistence, exporter and config hashing. The networking, TLS, scheduling and PDB config types are copied per CRD rather than shared; see [Copied config types](#copied-config-types).
 - **Rolling restarts are new work, not reuse.** The existing proactive handoff is `CLUSTER FAILOVER` (`performFailover`, with its TAKEOVER variant), which has no Sentinel equivalent. Because Sentinel is the failover authority, the operator must request `SENTINEL FAILOVER` and wait for Sentinel to complete it before rolling the old primary. That is a different control flow, not a parameter on the existing one. See [Planned operations](#planned-operations).
 - Stable client entry points: a Sentinel endpoint for failover-aware clients, plus stable per-pod DNS. Role-selector Services are out of scope; see [Client entry points](#client-entry-points).
 - HA intent is explicit. `spec.failover.mode` states who promotes, and an instance declaring `Sentinel` with nothing monitoring it is `Degraded` rather than quietly unprotected.
@@ -55,13 +55,21 @@ Today the operator supports cluster mode only ([quickstart.md](https://github.co
 | `ValkeyNode` | **Unchanged** | Data pods reuse it as-is. Two extensions were considered and deferred. See [`ValkeyNode`: no changes](#valkeynode-no-changes) | No (internal) |
 | `ValkeyCluster` | Unchanged | — | Yes |
 
-Shared API types (`SchedulingSpec`, `PersistenceSpec`, `ExporterSpec`, `UserAclSpec`, `WorkloadType`, `NetworkingSpec`, `TLSSpec`) are reused as is from `api/v1alpha1`.
+Shared API types (`PersistenceSpec`, `ExporterSpec`, `UserAclSpec`, `WorkloadType`, `TLSCertificates`) are reused as is from `api/v1alpha1`. Networking, TLS, scheduling and PDB are copied per CRD; see [Copied config types](#copied-config-types).
 
-### PodDisruptionBudget and TLS types
+### Copied config types
 
-**TLS: reuse unchanged.** `NodeTLSSpec` and `TLSSpec` are not cluster-shaped. `ValkeyNode` already consumes `NodeTLSSpec`, and `ValkeyNode` is topology-agnostic. The cluster-specific part is the *defaulting*, where an unset `serverName` falls back to the cluster headless FQDN. That is controller logic, and the `Valkey` controller supplies its own fallback. No new type is needed.
+Networking, TLS, scheduling and PDB are copied per CRD rather than shared with `ValkeyCluster`. The cost is a near-duplicate struct and a generated deepcopy per CRD. All of them live in `api/v1alpha1`, so each copy needs a distinct Go name. The benefit is that the CRDs evolve independently through `v1alpha1`. That matters while `ValkeyCell` and `ValkeyPool` are still undesigned. A field added for one topology cannot leak into another's schema.
 
-**PDB: a separate type per CRD.** Each new CRD gets its own PDB config type rather than sharing `ValkeyCluster`'s. The cost is a near-duplicate struct and a generated deepcopy per CRD, since all of them live in `api/v1alpha1` and so need distinct Go names. The benefit is that the CRDs evolve independently through `v1alpha1`, which matters while `ValkeyCell` and `ValkeyPool` are still undesigned. A field added for one topology cannot leak into another's schema.
+This decision was settled in review of [PR #390](https://github.com/valkey-io/valkey-operator/pull/390). The `Valkey` side is built. `ValkeySentinel` follows the same shape.
+
+**Networking: copied, Discovery dropped.** `Valkey` gets `ValkeyNetworkingSpec`, `ValkeySentinel` gets `SentinelNetworkingSpec`. Each carries `clusterDomain` and a TLS block. `ValkeyCluster`'s `NetworkingSpec` also carries `Discovery`, which announces cluster endpoints after `CLUSTER SLOTS`. Neither new kind shards, so neither copies that field.
+
+**TLS: copied too.** `Valkey` gets `ValkeyTLSSpec`, `ValkeySentinel` gets `SentinelTLSSpec`, each a copy of `TLSSpec`. Cluster-specific detail is expected to land in the cluster type, so a shared type would couple the schemas. The generic leaf types `TLSCertificates` and `CertificateSource` are reused rather than copied. The cluster-specific part of the old design was the *defaulting*, where an unset `serverName` falls back to the headless FQDN. That is controller logic, supplied per controller.
+
+**Scheduling: copied, Node/Zone spread dropped.** `Valkey` gets `ValkeySchedulingSpec`, `ValkeySentinel` gets `SentinelSchedulingSpec`. Each keeps the flat placement fields (`tolerations`, `nodeSelector`, `affinity`, `topologySpreadConstraints`, `priorityClassName`). `ValkeyCluster`'s `SchedulingSpec` also carries `Node` and `Zone` spread, which assume shards and primaries. Neither new kind has those, so neither copies them.
+
+**PDB: a separate type per CRD.** Each new CRD gets its own PDB config type: `ValkeyPodDisruptionBudgetConfig` and `SentinelPodDisruptionBudgetConfig`.
 
 ```go
 // ValkeyPodDisruptionBudgetConfig manages the PDB over a Valkey's data pods.
@@ -113,7 +121,7 @@ type ValkeySpec struct {
     Image                         string                         `json:"image,omitempty"`
     ImagePullSecrets              []corev1.LocalObjectReference  `json:"imagePullSecrets,omitempty"`
     Resources                     corev1.ResourceRequirements    `json:"resources,omitempty"`
-    Scheduling                    *SchedulingSpec                `json:"scheduling,omitempty"`
+    Scheduling                    *ValkeySchedulingSpec          `json:"scheduling,omitempty"`
     Exporter                      ExporterSpec                   `json:"exporter,omitempty"`
     // WorkloadType is immutable.
     // Switching it would strand the previous workload, and its PVCs
@@ -123,7 +131,7 @@ type ValkeySpec struct {
     Users                         []UserAclSpec                  `json:"users,omitempty"`
     Containers                    []corev1.Container             `json:"containers,omitempty"`
     Config                        map[string]string              `json:"config,omitempty"`
-    Networking                    *NetworkingSpec                `json:"networking,omitempty"`
+    Networking                    *ValkeyNetworkingSpec          `json:"networking,omitempty"`
     PodDisruptionBudget           *ValkeyPodDisruptionBudgetConfig `json:"podDisruptionBudget,omitempty"`
     PodSecurityContext            *corev1.PodSecurityContext     `json:"podSecurityContext,omitempty"`
     TerminationGracePeriodSeconds *int64                         `json:"terminationGracePeriodSeconds,omitempty"`
@@ -309,9 +317,9 @@ type ValkeySentinelSpec struct {
     Image              string                        `json:"image,omitempty"`
     ImagePullSecrets   []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
     Resources          corev1.ResourceRequirements   `json:"resources,omitempty"`
-    Scheduling         *SchedulingSpec               `json:"scheduling,omitempty"`
+    Scheduling         *SentinelSchedulingSpec       `json:"scheduling,omitempty"`
     Containers         []corev1.Container            `json:"containers,omitempty"`
-    Networking         *NetworkingSpec               `json:"networking,omitempty"`
+    Networking         *SentinelNetworkingSpec       `json:"networking,omitempty"`
     PodSecurityContext *corev1.PodSecurityContext    `json:"podSecurityContext,omitempty"`
 
     // Persistence for Sentinel's rewritten config. It is optional.
