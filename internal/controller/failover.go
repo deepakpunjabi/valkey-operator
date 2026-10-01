@@ -66,7 +66,7 @@ func findFailoverShard(state *valkey.ClusterState, address string) (*valkey.Shar
 	if primary == nil || primary.Address != address {
 		return nil, nil
 	}
-	replicas := shard.GetSyncedReplicas()
+	replicas := shard.GetSyncedReplicas(state)
 	if len(replicas) == 0 {
 		return nil, nil
 	}
@@ -143,8 +143,11 @@ func effectiveWorkloadType(t valkeyiov1alpha1.WorkloadType) valkeyiov1alpha1.Wor
 // desired template (see setDesiredWorkloadRevision), and liveTemplateHash is
 // the same hash of the live StatefulSet/Deployment template (empty when the
 // workload does not exist). Changes to Spec that render the same template
-// therefore never fail over; an empty liveTemplateHash means the update
-// creates a workload rather than rolling one. Config never enters the decision
+// therefore never fail over. An empty liveTemplateHash on a node that still
+// records a pod IP means the workload was deleted, usually orphaned with its
+// pod left running; the pod's template is unknown, so any revision change
+// counts as a roll. The recorded IP can be stale, but then the failover finds
+// no primary at that address and does nothing. Config never enters the decision
 // directly: live-settable keys are applied via CONFIG SET (see applyLiveConfig)
 // and the roll-relevant subset reaches the template as a derived annotation
 // (see buildPodTemplateAnnotations), so it is captured by the hashes.
@@ -157,37 +160,10 @@ func needsProactiveFailoverForRoll(current, desired *valkeyiov1alpha1.ValkeyNode
 	if effectiveWorkloadType(current.Spec.WorkloadType) != effectiveWorkloadType(desired.Spec.WorkloadType) {
 		return true
 	}
-	return liveTemplateHash != "" && liveTemplateHash != desired.Spec.WorkloadRevision
-}
-
-// anyNodeRequiresFailoverAwareRoll is true when at least one node needs a Spec
-// update that should scrape live topology for proactive failover / replica-first
-// primary placement. Pure WorkloadRevision backfill (live template already
-// matches) does not qualify.
-//
-// liveTemplateHashes maps ValkeyNode name -> hash of live pod template.
-func anyNodeRequiresFailoverAwareRoll(cluster *valkeyiov1alpha1.ValkeyCluster, nodeList *valkeyiov1alpha1.ValkeyNodeList, liveTemplateHashes map[string]string) bool {
-	byName := make(map[string]*valkeyiov1alpha1.ValkeyNode, len(nodeList.Items))
-	for i := range nodeList.Items {
-		byName[nodeList.Items[i].Name] = &nodeList.Items[i]
+	if liveTemplateHash == "" {
+		// No workload but a recorded pod IP: recreating the workload with a
+		// new revision can replace a pod it orphaned.
+		return current.Spec.WorkloadRevision != desired.Spec.WorkloadRevision
 	}
-	nodesPerShard := 1 + int(cluster.Spec.Replicas)
-	for shardIndex := range int(cluster.Spec.Shards) {
-		for nodeIndex := range nodesPerShard {
-			desired := buildClusterValkeyNode(cluster, shardIndex, nodeIndex)
-			if err := setDesiredWorkloadRevision(desired); err != nil {
-				return true
-			}
-			if current, ok := byName[desired.Name]; ok {
-				liveHash := ""
-				if liveTemplateHashes != nil {
-					liveHash = liveTemplateHashes[desired.Name]
-				}
-				if needsProactiveFailoverForRoll(current, desired, liveHash) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return liveTemplateHash != desired.Spec.WorkloadRevision
 }
