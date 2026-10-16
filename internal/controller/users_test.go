@@ -134,11 +134,11 @@ func TestValidateSystemUserPasswordSecret(t *testing.T) {
 	cluster := &valkeyiov1alpha1.ValkeyCluster{
 		Spec: valkeyiov1alpha1.ValkeyClusterSpec{
 			Exporter: valkeyiov1alpha1.ExporterSpec{
-				Enabled: boolPtr(true),
+				Enabled: new(true),
 			},
 		},
 	}
-	err := validateSystemUserPasswordSecret(userSecret, cluster)
+	err := validateSystemUserPasswordSecret(userSecret, cluster.Spec.ExporterEnabled())
 	if !errors.Is(err, errMissingSystemUser) {
 		t.Errorf("Validate System Users Password Failed. Expected '%s', got: '%s'", errMissingSystemUser.Error(), err.Error())
 	}
@@ -154,11 +154,11 @@ func TestValidateSystemUserPasswordSecret_UnknownUser(t *testing.T) {
 	cluster := &valkeyiov1alpha1.ValkeyCluster{
 		Spec: valkeyiov1alpha1.ValkeyClusterSpec{
 			Exporter: valkeyiov1alpha1.ExporterSpec{
-				Enabled: boolPtr(false),
+				Enabled: new(false),
 			},
 		},
 	}
-	err := validateSystemUserPasswordSecret(userSecret, cluster)
+	err := validateSystemUserPasswordSecret(userSecret, cluster.Spec.ExporterEnabled())
 	if !errors.Is(err, errUnknownSystemUser) {
 		t.Errorf("Validate System Users Password Failed. Expected '%s', got: '%s'", errUnknownSystemUser.Error(), err.Error())
 	}
@@ -172,11 +172,11 @@ func TestValidateSystemUserPasswordSecret_UnknownUserAndMissingRequiredUser(t *t
 	cluster := &valkeyiov1alpha1.ValkeyCluster{
 		Spec: valkeyiov1alpha1.ValkeyClusterSpec{
 			Exporter: valkeyiov1alpha1.ExporterSpec{
-				Enabled: boolPtr(false),
+				Enabled: new(false),
 			},
 		},
 	}
-	err := validateSystemUserPasswordSecret(userSecret, cluster)
+	err := validateSystemUserPasswordSecret(userSecret, cluster.Spec.ExporterEnabled())
 	if !errors.Is(err, errMissingSystemUser) {
 		t.Errorf("Validate System Users Password Failed. Expected '%s', got: '%s'", errMissingSystemUser.Error(), err.Error())
 	}

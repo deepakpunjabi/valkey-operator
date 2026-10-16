@@ -2,7 +2,7 @@
 
 This document describes the internal implementation of the valkey-operator for developers contributing to the codebase.
 
-For the user-facing API see [valkeycluster.md](valkeycluster.md). For the ValkeyNode CRD design rationale see [valkeynode-design.md](valkeynode-design.md). For status conditions and events see [status-conditions.md](status-conditions.md).
+For the user-facing API see [valkeycluster.md](valkeycluster.md). For the ValkeyNode CRD design rationale see [valkeynode-design.md](valkeynode-design.md). For the standalone Valkey CRD and controller see [valkey-design.md](valkey-design.md). For status conditions and events see [status-conditions.md](status-conditions.md).
 
 ## Controllers
 
@@ -54,7 +54,7 @@ It exists because a failover between two healthy pods moves nothing in Kubernete
 - A Valkey instance that fails to answer is backed off exponentially (up to a minute) rather than dialled every tick.
 - The Pod watch and the 30s backstop are both retained: the watch is faster for pod recreation, and the backstop is what makes a wedged poller a latency regression rather than an availability bug.
 
-Each tick opens one connection per node. That is the cost that sets the interval, and the `scrapeFunc` seam is where pooled clients will replace it.
+Each tick opens one connection per node through the `ClientProvider` in `internal/controller/clients.go`. That is the cost that sets the interval. Pooled clients will replace those per-tick connections behind the same provider, without changing the poller.
 
 ## Key packages
 
