@@ -130,15 +130,9 @@ type ValkeyPodDisruptionBudgetConfig struct {
 
 // ValkeySpec defines the desired state of Valkey.
 //
-// Replication is not implemented yet, so spec.replicas is pinned to 0 for now.
-// The restriction is relaxed when replication lands, which is a backwards compatible change.
-// Adding it later would not be.
-//
-// The has() guard is required to let users omit the field.
-// case: no replicas key --> admitted
-// case: replicas: 0 --> admitted
-// case: replicas: 2 --> rejected
-// +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas == 0",message="spec.replicas must be 0: replication is not implemented yet, only standalone Valkey is supported"
+// Replication needs a stable identity per pod, which a Deployment cannot give.
+// A standalone instance on a Deployment stays legal, since there is nothing to replicate.
+// +kubebuilder:validation:XValidation:rule="!has(self.replicas) || self.replicas == 0 || self.workloadType != 'Deployment'",message="spec.replicas above 0 requires workloadType StatefulSet"
 //
 // Persistence rules are copied from ValkeyClusterSpec so both kinds behave alike.
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.workloadType == 'Deployment')",message="persistence requires workloadType StatefulSet"
@@ -148,7 +142,7 @@ type ValkeyPodDisruptionBudgetConfig struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.persistence) || !has(oldSelf.persistence) || ((!has(self.persistence.storageClassName) && !has(oldSelf.persistence.storageClassName)) || (has(self.persistence.storageClassName) && has(oldSelf.persistence.storageClassName) && self.persistence.storageClassName == oldSelf.persistence.storageClassName))",message="persistence.storageClassName is immutable"
 type ValkeySpec struct {
 	// Replicas is the number of replicas in addition to the primary.
-	// Values above 0 are rejected until replication support lands.
+	// 0 is a lone primary.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	Replicas int32 `json:"replicas,omitempty"`
@@ -353,6 +347,26 @@ func (s ValkeySpec) PodDisruptionBudgetEnabled() bool {
 	}
 	return s.Replicas > 0
 }
+
+// Condition types a Valkey reports on top of Ready, Progressing and Degraded.
+const (
+	// ConditionPrimaryElected is True when exactly one node is the primary every other node follows.
+	ConditionPrimaryElected = "PrimaryElected"
+	// ConditionReplicationHealthy is True when every replica is ready and its link to the primary is up.
+	ConditionReplicationHealthy = "ReplicationHealthy"
+)
+
+// Reasons a Valkey reports on its replication conditions.
+const (
+	ReasonPrimaryElected      = "PrimaryElected"
+	ReasonPrimaryNotReady     = "PrimaryNotReady"
+	ReasonMultiplePrimaries   = "MultiplePrimaries"
+	ReasonNoPrimary           = "NoPrimary"
+	ReasonFailoverInProgress  = "FailoverInProgress"
+	ReasonReplicasInSync      = "ReplicasInSync"
+	ReasonReplicasNotSynced   = "ReplicasNotSynced"
+	ReasonReplicationCmdError = "ReplicationCommandError"
+)
 
 // +kubebuilder:object:root=true
 
