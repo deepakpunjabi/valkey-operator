@@ -83,12 +83,24 @@ const (
 	// tlsVolumeName is the name of the volume that will be mounted in the Valkey container.
 	tlsVolumeName = "tls-certs"
 	// tlsCertMountPath is the path where the TLS certificates are mounted in the Valkey container.
-	tlsCertMountPath = "/tls"
-	dataVolumeName   = "data"
-	dataMountPath    = "/data"
+	tlsCertMountPath  = "/tls"
+	dataVolumeName    = "data"
+	dataMountPath     = "/data"
+	scriptsVolumeName = "scripts"
+	scriptsMountPath  = "/scripts"
+	configVolumeName  = "valkey-conf"
+	configMountPath   = "/config"
+	// initVolumeName is the emptyDir the init container writes to and the
+	// server container reads from.
+	initVolumeName   = "init-conf"
+	initMountPath    = "/init"
 	tlsSecretKeyCA   = "ca.crt"
 	tlsSecretKeyCert = "tls.crt"
 	tlsSecretKeyKey  = "tls.key"
+	// tlsSecretKeyServerCA is where the server secret's ca.crt is projected
+	// when a trust bundle takes over ca.crt. Probes and the exporter verify the
+	// server against it.
+	tlsSecretKeyServerCA = "server-ca.crt"
 )
 
 // Role label values.
@@ -119,6 +131,19 @@ func labels(cluster *valkeyv1.ValkeyCluster) map[string]string {
 	for k, v := range cluster.Labels {
 		if _, exists := l[k]; !exists {
 			l[k] = v
+		}
+	}
+	return l
+}
+
+// valkeyLabels returns the standard labels for a Valkey merged with its user-defined labels.
+// The k8s recommended labels win over user-defined labels with the same key.
+// It mirrors labels() for ValkeyCluster.
+func valkeyLabels(v *valkeyv1.Valkey) map[string]string {
+	l := baseLabels(v.Name, "valkey")
+	for k, val := range v.Labels {
+		if _, exists := l[k]; !exists {
+			l[k] = val
 		}
 	}
 	return l
@@ -363,23 +388,24 @@ func nodeTLSServerName(node *valkeyv1.ValkeyNode) string {
 	return tlsServerName(override, clusterName, node.Namespace, node.Spec.ClusterDomain)
 }
 
-// getTLSConfig returns the TLS configuration for a ValkeyCluster.
-func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, namespace string, presentClientCert bool) (*tls.Config, error) {
+// getTLSConfig returns the TLS configuration for a ValkeyCluster and the
+// resourceVersion of the secret it was built from.
+func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, namespace string, presentClientCert bool) (*tls.Config, string, error) {
 	secret := &corev1.Secret{}
 	err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, secret)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	caData, caOk := secret.Data[tlsSecretKeyCA]
 
 	if !caOk {
-		return nil, fmt.Errorf("TLS secret is missing required key: ca=%v", caOk)
+		return nil, "", fmt.Errorf("TLS secret is missing required key: ca=%v", caOk)
 	}
 
 	caCertPool := x509.NewCertPool()
 	if !caCertPool.AppendCertsFromPEM(caData) {
-		return nil, fmt.Errorf("failed to parse CA certificates from secret key %q", "ca.crt")
+		return nil, "", fmt.Errorf("failed to parse CA certificates from secret key %q", "ca.crt")
 	}
 
 	tlsCfg := &tls.Config{
@@ -388,19 +414,19 @@ func getTLSConfig(ctx context.Context, c client.Reader, secretName, serverName, 
 		MinVersion: tls.VersionTLS12,
 	}
 	if !presentClientCert {
-		return tlsCfg, nil
+		return tlsCfg, secret.ResourceVersion, nil
 	}
 
 	certData, certOk := secret.Data[tlsSecretKeyCert]
 	keyData, keyOk := secret.Data[tlsSecretKeyKey]
 	if !certOk || !keyOk {
-		return nil, fmt.Errorf("TLS secret %q is missing required key: cert=%v, key=%v", secretName, certOk, keyOk)
+		return nil, "", fmt.Errorf("TLS secret %q is missing required key: cert=%v, key=%v", secretName, certOk, keyOk)
 	}
 
 	cert, err := tls.X509KeyPair(certData, keyData)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse TLS certificate/key from secret %q: %w", secretName, err)
+		return nil, "", fmt.Errorf("failed to parse TLS certificate/key from secret %q: %w", secretName, err)
 	}
 	tlsCfg.Certificates = []tls.Certificate{cert}
-	return tlsCfg, nil
+	return tlsCfg, secret.ResourceVersion, nil
 }

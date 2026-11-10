@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -43,6 +44,7 @@ const (
 
 	readinessScriptKey = "readiness-check.sh"
 	livenessScriptKey  = "liveness-check.sh"
+	initScriptKey      = "init.sh"
 
 	// Average-ish length of Valkey parameter + value
 	averageParameterLength = 20
@@ -74,7 +76,7 @@ var tlsAuthClientsUserDirective = map[valkeyiov1alpha1.TLSAuthClientsUser]string
 	valkeyiov1alpha1.TLSAuthClientsUserURI: "URI",
 }
 
-//go:embed scripts/*
+//go:embed scripts/*.sh
 var scripts embed.FS
 var scriptsHash string
 
@@ -163,6 +165,15 @@ func getBaseConfig(tls *valkeyiov1alpha1.NodeTLSSpec, hostnameAnnounce bool, ima
 		"shutdown-on-sigterm": "failover",
 	})
 
+	return baseConfig
+}
+
+// getStandaloneBaseConfig returns the base config for a standalone Valkey.
+// It drops the cluster directives of getBaseConfig, so the server runs with cluster-enabled no.
+// shutdown-on-sigterm stays at the server default because a standalone primary has no replica to fail over to.
+func getStandaloneBaseConfig(tls *valkeyiov1alpha1.NodeTLSSpec, image string) map[string]string {
+	baseConfig := buildManagedConfig(true, tls, false, image)
+	baseConfig["protected-mode"] = "no"
 	return baseConfig
 }
 
@@ -284,8 +295,15 @@ func renderServerConfig(userConfig, baseConfig map[string]string, excludeUserKey
 
 // buildServerConfig renders the full config written to the shared ConfigMap.
 func buildServerConfig(cluster *valkeyiov1alpha1.ValkeyCluster) string {
-	excludeKeys := gatedUserKeysToSuppress(cluster.Spec.Image, cluster.Spec.Config)
-	return renderServerConfig(cluster.Spec.Config, getBaseConfig(nodeTLSFromCluster(cluster), cluster.PrefersHostnameAnnounce(), cluster.Spec.Image), excludeKeys)
+	return buildServerConfigFrom(getBaseConfig(nodeTLSFromCluster(cluster), cluster.PrefersHostnameAnnounce(), cluster.Spec.Image), cluster.Spec.Image, cluster.Spec.Config)
+}
+
+// buildServerConfigFrom renders the full valkey.conf from a base config and the user config.
+// User config is written first and base config last, so base directives win.
+// Version-gated user keys are dropped.
+func buildServerConfigFrom(baseConfig map[string]string, image string, userConfig map[string]string) string {
+	excludeKeys := gatedUserKeysToSuppress(image, userConfig)
+	return renderServerConfig(userConfig, baseConfig, excludeKeys)
 }
 
 // nodeServerConfigRollHash derives the config roll hash from the node spec:
@@ -304,7 +322,14 @@ func nodeServerConfigRollHash(node *valkeyiov1alpha1.ValkeyNode) string {
 // Create or update a default valkey.conf
 // If additional config is provided, append to the default map
 func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) error {
+	rc := &resourceClient{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme, Recorder: r.Recorder}
+	return upsertServerConfigMap(ctx, rc, cluster, cluster.Name, cluster.Namespace, labels(cluster), buildServerConfig(cluster))
+}
 
+// upsertServerConfigMap creates or updates the server ConfigMap for an owner.
+// serverConfig is the already-rendered valkey.conf.
+// Shared by the ValkeyCluster and Valkey controllers.
+func upsertServerConfigMap(ctx context.Context, rc *resourceClient, owner client.Object, name, namespace string, labels map[string]string, serverConfig string) error {
 	log := logf.FromContext(ctx)
 
 	// Embed readiness check script
@@ -319,18 +344,20 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 		return fmt.Errorf("reading embedded liveness-check.sh: %w", err)
 	}
 
-	// Get the new server config
-	newServerConfig := buildServerConfig(cluster)
+	initScript, err := scripts.ReadFile("scripts/init.sh")
+	if err != nil {
+		return fmt.Errorf("reading embedded init.sh: %w", err)
+	}
 
 	// Calculate hash of constructed configMap contents (ie: updated scripts, changed/added parameters)
-	newServerConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(newServerConfig)))
+	newServerConfigHash := fmt.Sprintf("%x", sha256.Sum256([]byte(serverConfig)))
 
-	// Look for, and fetch existing configMap for this cluster
-	serverConfigMapName := GetServerConfigMapName(cluster.Name)
+	// Look for, and fetch existing configMap for this owner
+	serverConfigMapName := GetServerConfigMapName(name)
 	serverConfigMap := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{
+	if err := rc.Get(ctx, types.NamespacedName{
 		Name:      serverConfigMapName,
-		Namespace: cluster.Namespace,
+		Namespace: namespace,
 	}, serverConfigMap); err != nil {
 		if !apierrors.IsNotFound(err) {
 			log.Error(err, "failed to fetch server configmap")
@@ -343,8 +370,8 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 		// Create configMap object with contents
 		serverConfigMap.ObjectMeta = metav1.ObjectMeta{
 			Name:      serverConfigMapName,
-			Namespace: cluster.Namespace,
-			Labels:    labels(cluster),
+			Namespace: namespace,
+			Labels:    labels,
 			Annotations: map[string]string{
 				configHashKey:  newServerConfigHash,
 				scriptsHashKey: scriptsHash,
@@ -353,24 +380,25 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 		serverConfigMap.Data = map[string]string{
 			readinessScriptKey: string(readiness),
 			livenessScriptKey:  string(liveness),
-			configFileKey:      newServerConfig,
+			initScriptKey:      string(initScript),
+			configFileKey:      serverConfig,
 		}
 
 		// Register ownership of the configMap
-		if err := controllerutil.SetControllerReference(cluster, serverConfigMap, r.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(owner, serverConfigMap, rc.Scheme); err != nil {
 			log.Error(err, "Failed to grab ownership of server configMap")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ConfigMapCreationFailed", "UpsertConfigMap", "Failed to grab ownership of server configMap: %v", err)
+			rc.Recorder.Eventf(owner, nil, corev1.EventTypeWarning, "ConfigMapCreationFailed", "UpsertConfigMap", "Failed to grab ownership of server configMap: %v", err)
 			return err
 		}
 
 		// Create the configMap
-		if err := r.Create(ctx, serverConfigMap); err != nil {
+		if err := rc.Create(ctx, serverConfigMap); err != nil {
 			log.Error(err, "Failed to create server configMap")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ConfigMapCreationFailed", "UpsertConfigMap", "Failed to create server configMap: %v", err)
+			rc.Recorder.Eventf(owner, nil, corev1.EventTypeWarning, "ConfigMapCreationFailed", "UpsertConfigMap", "Failed to create server configMap: %v", err)
 			return err
 		}
 
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ConfigMapCreated", "UpsertConfigMap", "Created server configMap")
+		rc.Recorder.Eventf(owner, nil, corev1.EventTypeNormal, "ConfigMapCreated", "UpsertConfigMap", "Created server configMap")
 		return nil
 	}
 
@@ -379,9 +407,10 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 	// Compare scripts hash in existing configMap to const value in operator; update scripts contents if different
 	updatedScripts := upsertAnnotation(serverConfigMap, scriptsHashKey, scriptsHash)
 	if updatedScripts {
-		log.V(1).Info("updated readiness, and liveness scripts")
+		log.V(1).Info("updated readiness, liveness and init scripts")
 		serverConfigMap.Data[readinessScriptKey] = string(readiness)
 		serverConfigMap.Data[livenessScriptKey] = string(liveness)
+		serverConfigMap.Data[initScriptKey] = string(initScript)
 	}
 
 	// Evaluate both upsertAnnotation calls unconditionally so the configHashKey
@@ -397,16 +426,16 @@ func (r *ValkeyClusterReconciler) upsertConfigMap(ctx context.Context, cluster *
 	}
 
 	// Update the configMap with the generated config contents
-	serverConfigMap.Data[configFileKey] = newServerConfig
+	serverConfigMap.Data[configFileKey] = serverConfig
 
 	// Update
-	if err := r.Update(ctx, serverConfigMap); err != nil {
+	if err := rc.Update(ctx, serverConfigMap); err != nil {
 		log.Error(err, "Failed to update server configMap")
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ConfigMapUpdateFailed", "UpsertConfigMap", "Failed to update server configMap: %v", err)
+		rc.Recorder.Eventf(owner, nil, corev1.EventTypeWarning, "ConfigMapUpdateFailed", "UpsertConfigMap", "Failed to update server configMap: %v", err)
 		return err
 	}
 
-	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ConfigMapUpdated", "UpsertConfigMap", "Synchronized server configMap")
+	rc.Recorder.Eventf(owner, nil, corev1.EventTypeNormal, "ConfigMapUpdated", "UpsertConfigMap", "Synchronized server configMap")
 	return nil
 }
 
@@ -434,6 +463,11 @@ func init() {
 		panic("failure reading embedded liveness-check.sh")
 	}
 
-	// Calculate hash of both files
-	scriptsHash = fmt.Sprintf("%x", sha256.Sum256(append(readiness, liveness...)))
+	initScript, err := scripts.ReadFile("scripts/init.sh")
+	if err != nil {
+		panic("failure reading embedded init.sh")
+	}
+
+	// Calculate hash of all scripts
+	scriptsHash = fmt.Sprintf("%x", sha256.Sum256(append(append(readiness, liveness...), initScript...)))
 }

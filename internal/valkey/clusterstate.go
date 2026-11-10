@@ -18,7 +18,6 @@ package valkey
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"net"
 	"slices"
@@ -29,8 +28,15 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// DialFunc returns a client for the Valkey node at address (host:port). The
+// client belongs to whoever supplies the DialFunc; callers never call Close on
+// it.
+type DialFunc func(ctx context.Context, address string) (vclient.Client, error)
+
 // NodeState represents the current state of an inspected cluster node.
 type NodeState struct {
+	// Client is for commands only. It belongs to whoever supplies the
+	// DialFunc; never call Close on it.
 	Client      vclient.Client
 	Address     string
 	Port        int
@@ -127,7 +133,7 @@ func FormatSlotsRanges(ranges []SlotsRange) string {
 }
 
 // GetClusterState connects to Valkey nodes and scrapes the current state.
-func GetClusterState(ctx context.Context, addresses []string, port int, username, password string, tlsCfg *tls.Config) *ClusterState {
+func GetClusterState(ctx context.Context, addresses []string, port int, dial DialFunc) *ClusterState {
 	state := ClusterState{
 		Shards:       make([]*ShardState, 0),
 		PendingNodes: make([]*NodeState, 0),
@@ -135,7 +141,7 @@ func GetClusterState(ctx context.Context, addresses []string, port int, username
 
 	for _, address := range addresses {
 		// Attempt to connect to the Valkey node and extract information.
-		node := getNodeState(ctx, address, port, username, password, tlsCfg)
+		node := getNodeState(ctx, address, port, dial)
 		if node != nil {
 			// Check if node is pending to be added. A primary carrying only a
 			// migration marker is mid-reshard and already part of the slot map,
@@ -168,23 +174,34 @@ func GetClusterState(ctx context.Context, addresses []string, port int, username
 			}
 		}
 	}
+	state.adoptDrainedPrimaries()
 	return &state
 }
 
-// CloseClients disconnects all valkey-go clients.
-func (s *ClusterState) CloseClients() {
+// adoptDrainedPrimaries moves a slot-less pending primary into the shard of a
+// replica that names it as its primary, when that shard has no primary of its
+// own. A primary drained to zero slots keeps its replica and stays a primary
+// (cluster-allow-replica-migration no): it leads an empty shard, it is not a
+// node waiting to join. A scale-in reverted right after its drain leaves one
+// behind. Any other slot-less primary, a scale-out leader before its replicas
+// attach or a stray beside a live primary, stays pending.
+func (s *ClusterState) adoptDrainedPrimaries() {
+	pending := s.PendingNodes[:0]
 	for _, node := range s.PendingNodes {
-		if node.Client != nil {
-			node.Client.Close()
+		idx := slices.IndexFunc(s.Shards, func(shard *ShardState) bool {
+			return shard.PrimaryId == "" && slices.ContainsFunc(shard.Nodes, func(n *NodeState) bool {
+				return n.PrimaryIdFromSelf() == node.Id
+			})
+		})
+		if idx < 0 {
+			pending = append(pending, node)
+			continue
 		}
+		shard := s.Shards[idx]
+		shard.Nodes = append(shard.Nodes, node)
+		shard.PrimaryId = node.Id
 	}
-	for _, shard := range s.Shards {
-		for _, node := range shard.Nodes {
-			if node.Client != nil {
-				node.Client.Close()
-			}
-		}
-	}
+	s.PendingNodes = pending
 }
 
 // GetUnassignedSlots returns all unassigned slots
@@ -579,41 +596,14 @@ func (n *NodeState) GetFailingNodes() []ClusterNode {
 }
 
 // Connect to a single Valkey node and scrapes its current state.
-func getNodeState(ctx context.Context, address string, port int, username string, password string, tlsConfig *tls.Config) *NodeState {
-	log := logf.FromContext(ctx)
+func getNodeState(ctx context.Context, address string, port int, dial DialFunc) *NodeState {
+	hostPort := net.JoinHostPort(address, strconv.Itoa(port))
+	log := logf.FromContext(ctx).WithValues("address", hostPort)
 
-	opt := vclient.ClientOption{
-		InitAddress:       []string{fmt.Sprintf("%s:%d", address, port)},
-		ForceSingleClient: true, // Don't connect to another cluster node.
-		Username:          username,
-		Password:          password,
-		TLSConfig:         tlsConfig,
-		// valkey-go defaults to data-plane sizes: up to 4 connections per
-		// client, each with 0.5 MiB buffers either way and a 1024-entry ring.
-		// Tuned to this controller's usage: one connection issuing a few
-		// commands with no concurrency, CLUSTER NODES the largest response and
-		// CLUSTER MIGRATESLOTS the largest request. Exceeding a buffer costs a
-		// flush, no error.
-		PipelineMultiplex:   -1, // at most 1 connection, not the default 4
-		ReadBufferEachConn:  16 * 1024,
-		WriteBufferEachConn: 8 * 1024,
-		RingScaleEachConn:   4, // 2^4 slots, used by concurrent ops only
-	}
-	client, err := vclient.NewClient(opt)
+	client, err := dial(ctx, hostPort)
 	if err != nil {
-		if !strings.Contains(err.Error(), "WRONGPASS") {
-			log.Error(err, "failed to create Valkey client")
-			return nil
-		}
-		// fallback to unauthenticated
-		log.Info("fall back to unauthenticated default user on WRONGPASS error")
-		opt.Username = ""
-		opt.Password = ""
-		client, err = vclient.NewClient(opt)
-		if err != nil {
-			log.Error(err, "failed to create Valkey client")
-			return nil
-		}
+		log.Error(err, "failed to create Valkey client")
+		return nil
 	}
 
 	node := NodeState{Client: client,
@@ -627,6 +617,17 @@ func getNodeState(ctx context.Context, address string, port int, username string
 		client.B().ClusterInfo().Build(),
 		client.B().ClusterNodes().Build(),
 	)
+
+	// The round trip can fail without a dial error: a pooled client may point
+	// at a server that went away since its last use, or the caller's context
+	// may have expired, as when an earlier node used up the role poller's pass
+	// budget. All five commands share one wire, so a transport-level failure
+	// on the first result means the whole round trip failed, not just one
+	// command.
+	if len(results) > 0 && results[0].NonValkeyError() != nil {
+		log.Error(results[0].NonValkeyError(), "failed to reach Valkey node")
+		return nil
+	}
 
 	if len(results) == 5 {
 		id, err := results[0].ToString()
